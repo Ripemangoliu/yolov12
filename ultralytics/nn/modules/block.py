@@ -1450,41 +1450,77 @@ class DGHVA2Block(nn.Module):
         return x
 
 
-class DGHVA2C2f(nn.Module):
+class DGHVAAttn(nn.Module):
     """
-    Direction-Gated HV-A2 version of A2C2f / R-ELAN.
-    Used to replace A2C2f at the P4 stage.
+    Direction-Gated Horizontal-Vertical Area Attention.
+
+    This version pads feature maps when H*W is not divisible by area,
+    then crops the output back to the original size.
     """
 
-    def __init__(self, c1, c2, n=1, a2=True, area=1,
-                 residual=False, mlp_ratio=2.0, e=0.5, g=1, shortcut=True):
+    def __init__(self, dim, area=1):
         super().__init__()
+        assert dim % 2 == 0, "DGHVAAttn requires even hidden channels."
 
-        c_ = int(c2 * e)
-        assert c_ % 64 == 0, \
-            "DGHVA2C2f hidden channels should be divisible by 64 for two A2 branches."
+        c_half = dim // 2
+        assert c_half >= 32 and c_half % 32 == 0, \
+            "Each branch channel should be a multiple of 32 for AAttn."
 
-        num_heads = c_ // 32
+        num_heads = c_half // 32
+        self.area = area
 
-        self.cv1 = Conv(c1, c_, 1, 1)
-        self.cv2 = Conv((1 + n) * c_, c2, 1)
+        self.h_attn = AAttn(c_half, num_heads=num_heads, area=area)
+        self.v_attn = AAttn(c_half, num_heads=num_heads, area=area)
 
-        init_values = 0.01
-        self.gamma = nn.Parameter(init_values * torch.ones((c2)), requires_grad=True) if a2 and residual else None
-
-        self.m = nn.ModuleList(
-            nn.Sequential(*(DGHVA2Block(c_, num_heads, mlp_ratio, area) for _ in range(2)))
-            if a2 else C3k(c_, c_, 2, shortcut, g)
-            for _ in range(n)
+        self.gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(dim, c_half, kernel_size=1, bias=True),
+            nn.Sigmoid()
         )
 
+        self.fuse = Conv(dim, dim, 1, act=False)
+
+    def _pad_to_area(self, x):
+        """
+        Pad feature map so that H*W can be divided by self.area.
+        Return padded x and original H, W.
+        """
+        B, C, H, W = x.shape
+
+        if self.area <= 1 or (H * W) % self.area == 0:
+            return x, H, W
+
+        # Try padding width first.
+        for pad_w in range(1, self.area + 1):
+            if (H * (W + pad_w)) % self.area == 0:
+                x = F.pad(x, (0, pad_w, 0, 0))
+                return x, H, W
+
+        # Then try padding height.
+        for pad_h in range(1, self.area + 1):
+            if ((H + pad_h) * W) % self.area == 0:
+                x = F.pad(x, (0, 0, 0, pad_h))
+                return x, H, W
+
+        return x, H, W
+
     def forward(self, x):
-        y = [self.cv1(x)]
-        y.extend(m(y[-1]) for m in self.m)
+        # x: [B, C, H, W]
+        x_h, x_v = x.chunk(2, dim=1)
 
-        out = self.cv2(torch.cat(y, 1))
+        # Horizontal branch
+        x_h_pad, H_h, W_h = self._pad_to_area(x_h)
+        y_h = self.h_attn(x_h_pad)
+        y_h = y_h[:, :, :H_h, :W_h]
 
-        if self.gamma is not None:
-            return x + self.gamma.view(1, -1, 1, 1) * out
+        # Vertical branch
+        x_v = x_v.transpose(2, 3).contiguous()
+        x_v_pad, H_v, W_v = self._pad_to_area(x_v)
+        y_v = self.v_attn(x_v_pad)
+        y_v = y_v[:, :, :H_v, :W_v]
+        y_v = y_v.transpose(2, 3).contiguous()
 
-        return out
+        alpha = self.gate(x)
+
+        y = torch.cat((alpha * y_h, (1.0 - alpha) * y_v), dim=1)
+        return self.fuse(y)
