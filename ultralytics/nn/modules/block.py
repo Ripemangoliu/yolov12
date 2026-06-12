@@ -1374,86 +1374,6 @@ class DGHVAAttn(nn.Module):
     """
     Direction-Gated Horizontal-Vertical Area Attention.
 
-    Lightweight version:
-    - half channels for horizontal A2
-    - half channels for vertical A2
-    - channel-wise gate for directional fusion
-    """
-
-    def __init__(self, dim, area=1):
-        super().__init__()
-        assert dim % 2 == 0, "DGHVAAttn requires even hidden channels."
-
-        c_half = dim // 2
-        assert c_half >= 32 and c_half % 32 == 0, \
-            "Each branch channel should be a multiple of 32 for AAttn."
-
-        num_heads = c_half // 32
-
-        self.h_attn = AAttn(c_half, num_heads=num_heads, area=area)
-        self.v_attn = AAttn(c_half, num_heads=num_heads, area=area)
-
-        # channel-wise direction gate
-        self.gate = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(dim, c_half, kernel_size=1, bias=True),
-            nn.Sigmoid()
-        )
-
-        self.fuse = Conv(dim, dim, 1, act=False)
-
-    def forward(self, x):
-        # x: [B, C, H, W]
-        x_h, x_v = x.chunk(2, dim=1)
-
-        # horizontal area attention
-        y_h = self.h_attn(x_h)
-
-        # vertical area attention:
-        # swap H and W, apply original A2, then swap back
-        y_v = self.v_attn(x_v.transpose(2, 3).contiguous())
-        y_v = y_v.transpose(2, 3).contiguous()
-
-        alpha = self.gate(x)
-
-        # alpha controls horizontal branch, 1-alpha controls vertical branch
-        y = torch.cat((alpha * y_h, (1.0 - alpha) * y_v), dim=1)
-        return self.fuse(y)
-
-
-class DGHVA2Block(nn.Module):
-    """
-    ABlock variant using Direction-Gated HV-A2.
-    """
-
-    def __init__(self, dim, num_heads=None, mlp_ratio=1.2, area=1):
-        super().__init__()
-        self.attn = DGHVAAttn(dim, area=area)
-
-        mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = nn.Sequential(
-            Conv(dim, mlp_hidden_dim, 1),
-            Conv(mlp_hidden_dim, dim, 1, act=False)
-        )
-
-        self.apply(self._init_weights)
-
-    def _init_weights(self, m):
-        if isinstance(m, nn.Conv2d):
-            nn.init.trunc_normal_(m.weight, std=0.02)
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-
-    def forward(self, x):
-        x = x + self.attn(x)
-        x = x + self.mlp(x)
-        return x
-
-
-class DGHVAAttn(nn.Module):
-    """
-    Direction-Gated Horizontal-Vertical Area Attention.
-
     This version pads feature maps when H*W is not divisible by area,
     then crops the output back to the original size.
     """
@@ -1524,3 +1444,72 @@ class DGHVAAttn(nn.Module):
 
         y = torch.cat((alpha * y_h, (1.0 - alpha) * y_v), dim=1)
         return self.fuse(y)
+
+
+class DGHVA2Block(nn.Module):
+    """
+    ABlock variant using Direction-Gated HV-A2.
+    """
+
+    def __init__(self, dim, num_heads=None, mlp_ratio=1.2, area=1):
+        super().__init__()
+        self.attn = DGHVAAttn(dim, area=area)
+
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            Conv(dim, mlp_hidden_dim, 1),
+            Conv(mlp_hidden_dim, dim, 1, act=False)
+        )
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Conv2d):
+            nn.init.trunc_normal_(m.weight, std=0.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        x = x + self.attn(x)
+        x = x + self.mlp(x)
+        return x
+
+
+class DGHVA2C2f(nn.Module):
+    """
+    Direction-Gated HV-A2 version of A2C2f / R-ELAN.
+    Used to replace A2C2f at the P4 stage.
+    """
+
+    def __init__(self, c1, c2, n=1, a2=True, area=1,
+                 residual=False, mlp_ratio=2.0, e=0.5, g=1, shortcut=True):
+        super().__init__()
+
+        c_ = int(c2 * e)
+        assert c_ % 64 == 0, \
+            "DGHVA2C2f hidden channels should be divisible by 64 for two A2 branches."
+
+        num_heads = c_ // 32
+
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv((1 + n) * c_, c2, 1)
+
+        init_values = 0.01
+        self.gamma = nn.Parameter(init_values * torch.ones((c2)), requires_grad=True) if a2 and residual else None
+
+        self.m = nn.ModuleList(
+            nn.Sequential(*(DGHVA2Block(c_, num_heads, mlp_ratio, area) for _ in range(2)))
+            if a2 else C3k(c_, c_, 2, shortcut, g)
+            for _ in range(n)
+        )
+
+    def forward(self, x):
+        y = [self.cv1(x)]
+        y.extend(m(y[-1]) for m in self.m)
+
+        out = self.cv2(torch.cat(y, 1))
+
+        if self.gamma is not None:
+            return x + self.gamma.view(1, -1, 1, 1) * out
+
+        return out
